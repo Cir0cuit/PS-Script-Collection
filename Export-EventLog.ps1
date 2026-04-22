@@ -1,5 +1,5 @@
 # Advanced Windows Event Log Export Script for LLM Analysis
-# Exports Error, Warning, and Critical events from last 7 days with optimization
+# Exports every event type (including Security audit events) from the last 7 days with optimization
 
 # Date: 2025-11-13
 # Purpose: Export event logs in optimized format for LLM analysis with size management
@@ -11,10 +11,11 @@
     Exports Windows Event Logs for LLM analysis with automatic size management.
 
 .DESCRIPTION
-    This script exports Windows Event Logs (Application, System, Security) from the last 7 days,
-    focusing on Critical, Error, and Warning events. The output is formatted as CSV files
-    optimized for LLM analysis with automatic file size management to prevent exceeding
-    upload limits.
+    This script exports Windows Event Logs (Application, System, Security) from the last 7 days.
+    By default every event type is exported, including Security audit events (Audit Success /
+    Audit Failure) which use Level 0 and would be filtered out by the old behavior.
+    The output is formatted as CSV files optimized for LLM analysis with automatic file
+    size management to prevent exceeding upload limits.
 
 .PARAMETER ExportPath
     Directory where exported files will be saved. Default: C:\EventLogExports
@@ -25,14 +26,18 @@
 .PARAMETER MaxFileSizeMB
     Maximum file size in MB before creating separate files. Default: 10
 
-.PARAMETER IncludeInformational
-    Switch to include Informational events (Level 4). Default: False
+.PARAMETER EventLevels
+    Integer array of event levels to export. 0=LogAlways/Audit, 1=Critical, 2=Error, 3=Warning,
+    4=Information, 5=Verbose. Default: all levels (0-5).
 
 .EXAMPLE
-    .\Export-EventLogsForLLM.ps1
+    .\Export-EventLog.ps1
 
 .EXAMPLE
-    .\Export-EventLogsForLLM.ps1 -DaysToExport 3 -MaxFileSizeMB 5
+    .\Export-EventLog.ps1 -DaysToExport 3 -MaxFileSizeMB 5
+
+.EXAMPLE
+    .\Export-EventLog.ps1 -EventLevels 1,2,3
 
 .NOTES
     Requires Administrator privileges to access Security log.
@@ -42,21 +47,12 @@ param(
     [string]$ExportPath = "C:\EventLogExports",
     [int]$DaysToExport = 7,
     [int]$MaxFileSizeMB = 10,
-    [switch]$IncludeInformational
+    [int[]]$EventLevels = @(0, 1, 2, 3, 4, 5)
 )
 
 # Configuration
 $DateStamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
 $ComputerName = $env:COMPUTERNAME
-
-# Event Levels to Export
-if ($IncludeInformational) {
-    $EventLevels = @(1, 2, 3, 4)  # Critical, Error, Warning, Information
-    Write-Host "Including Informational events" -ForegroundColor Yellow
-}
-else {
-    $EventLevels = @(1, 2, 3)  # Critical, Error, Warning only
-}
 
 # Logs to Export
 $LogsToExport = @(
@@ -88,6 +84,7 @@ Write-Host ""
 function Get-EventLevelText {
     param([int]$Level)
     switch ($Level) {
+        0 { return "Information" }  # LogAlways - used by Security audit events
         1 { return "Critical" }
         2 { return "Error" }
         3 { return "Warning" }
@@ -95,6 +92,20 @@ function Get-EventLevelText {
         5 { return "Verbose" }
         default { return "Unknown" }
     }
+}
+
+# Function to derive a display-friendly severity, promoting Security audit
+# keywords (Audit Success / Audit Failure) above the numeric level.
+function Get-EventDisplayLevel {
+    param($Event)
+
+    $Keywords = $Event.KeywordsDisplayNames
+    if ($Keywords) {
+        if ($Keywords -contains "Audit Failure") { return "Audit Failure" }
+        if ($Keywords -contains "Audit Success") { return "Audit Success" }
+    }
+
+    return Get-EventLevelText -Level $Event.Level
 }
 
 # Function to sanitize text for CSV and LLM readability
@@ -131,11 +142,18 @@ function Export-EventLogData {
     Write-Host "[$($LogName)] Processing..." -ForegroundColor Cyan
 
     try {
-        # Build filter hashtable
+        # Build filter hashtable. Only add the Level filter when the caller
+        # requested a strict subset — specifying Level = 0 alongside others in
+        # FilterHashtable has historically been unreliable, and omitting the
+        # key is the simplest way to "export every type".
         $FilterHashtable = @{
             LogName   = $LogName
-            Level     = $Levels
             StartTime = $StartDate
+        }
+        $AllLevels = @(0, 1, 2, 3, 4, 5)
+        $IsSubset = $Levels -and (Compare-Object $Levels $AllLevels | Where-Object { $_.SideIndicator -eq '=>' })
+        if ($IsSubset) {
+            $FilterHashtable['Level'] = $Levels
         }
 
         # Get events
@@ -162,7 +180,8 @@ function Export-EventLogData {
                     -PercentComplete (($EventCounter / $Events.Count) * 100)
             }
 
-            $LevelText = Get-EventLevelText -Level $Event.Level
+            $LevelText = Get-EventDisplayLevel -Event $Event
+            $KeywordsText = if ($Event.KeywordsDisplayNames) { ($Event.KeywordsDisplayNames -join ", ") } else { "" }
 
             # Parse XML for event data
             [xml]$EventXml = $Event.ToXml()
@@ -189,6 +208,7 @@ function Export-EventLogData {
                 LogName      = $Event.LogName
                 Level        = $LevelText
                 LevelId      = $Event.Level
+                Keywords     = $KeywordsText
                 EventID      = $Event.Id
                 Source       = $Event.ProviderName
                 TaskCategory = if ($Event.TaskDisplayName) { $Event.TaskDisplayName } else { "None" }
@@ -343,7 +363,10 @@ These CSV files are optimized for Large Language Model analysis.
 File Structure:
 - TimeCreated    : Timestamp of the event
 - LogName        : Source log (Application/System/Security)
-- Level          : Event severity (Critical/Error/Warning)
+- Level          : Event severity (Critical/Error/Warning/Information/Verbose)
+                   or Audit Success/Audit Failure for Security log events
+- LevelId        : Numeric level (0-5)
+- Keywords       : Raw keyword display names (includes Audit Success/Failure)
 - EventID        : Unique event identifier
 - Source         : Provider/component that logged the event
 - Message        : Detailed event description
@@ -355,9 +378,10 @@ Recommended Analysis Workflow:
 1. Start with Critical events - these indicate severe failures
 2. Analyze Error events for application/system issues
 3. Review Warning events for potential problems
-4. Look for patterns in EventID and Source fields
-5. Correlate events across different logs by timestamp
-6. Focus on recurring events (same EventID, similar messages)
+4. Review Audit Failure events in the Security log for auth/access issues
+5. Look for patterns in EventID and Source fields
+6. Correlate events across different logs by timestamp
+7. Focus on recurring events (same EventID, similar messages)
 
 Common Analysis Queries for LLM:
 - "Summarize all Critical events and their root causes"
@@ -370,6 +394,10 @@ Event Level Priorities:
 - Critical (1)    : Immediate action required - system failure
 - Error (2)       : Significant problems requiring investigation
 - Warning (3)     : Potential issues, may not need immediate action
+- Information (0 / 4) : Routine events; Security audit events report here
+- Verbose (5)     : Low-level diagnostic detail
+- Audit Failure   : Security-relevant failure (e.g. failed logon)
+- Audit Success   : Security-relevant success (e.g. successful logon)
 
 Security Log Notes:
 - Event 4624 : Successful logon
